@@ -1,0 +1,30 @@
+{
+  "expo": {
+    "name": "Stock AI Analysis",
+    "slug": "stock-ai-app",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "backgroundColor": "#0D0D0D",
+    "splash": {
+      "backgroundColor": "#0D0D0D",
+      "resizeMode": "contain"
+    },
+    "assetBundlePatterns": ["**/*"],
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.stockai.app"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#0D0D0D"
+      },
+      "package": "com.stockai.app",
+      "softwareKeyboardLayoutMode": "pan"
+    },
+    "plugins": [
+      "expo-splash-screen"
+    ]
+  }
+}
