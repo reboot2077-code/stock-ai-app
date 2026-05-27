@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: stock-ai-backend
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: DEEPSEEK_API_KEY
+        sync: false
+      - key: PORT
+        value: "10000"
+    plan: free
