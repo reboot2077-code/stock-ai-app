@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 import requests
+import yfinance as yf
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -19,6 +20,35 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.getenv(
     "DEEPSEEK_BASE_URL", "https://api.deepseek.com/chat/completions"
 )
+
+# Stock name cache
+_stock_names: dict[str, str] = {}
+
+
+def _load_stock_names():
+    global _stock_names
+    if _stock_names:
+        return
+    try:
+        df = pd.read_csv(
+            "https://raw.githubusercontent.com/reboot2077-code/stock-ai-app/master/backend/stock_list.csv"
+        )
+        _stock_names = dict(zip(df["code"].astype(str), df["name"].astype(str)))
+    except Exception:
+        _stock_names = {}
+
+
+def _get_stock_name(code: str) -> str:
+    _load_stock_names()
+    return _stock_names.get(code, code)
+
+
+def _to_yf_code(code: str) -> str:
+    if code.startswith("6") or code.startswith("5"):
+        return f"{code}.SS"
+    elif code.startswith("0") or code.startswith("3") or code.startswith("1"):
+        return f"{code}.SZ"
+    return f"{code}.SS"
 
 
 def calc_ma(close: pd.Series, period: int):
@@ -53,18 +83,6 @@ def calc_bollinger(close: pd.Series, period=20, std=2):
     upper = (ma + std * sd).round(4)
     lower = (ma - std * sd).round(4)
     return upper.tolist(), ma.round(4).tolist(), lower.tolist()
-
-
-def calc_atr(high: pd.Series, low: pd.Series, close: pd.Series, period=14):
-    tr = pd.concat(
-        [
-            high - low,
-            (high - close.shift()).abs(),
-            (low - close.shift()).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    return tr.ewm(alpha=1 / period, adjust=False).mean().round(4).tolist()
 
 
 def find_support_resistance(df: pd.DataFrame):
@@ -170,6 +188,11 @@ MACD DIF：{dif}，DEA：{dea}
 """
 
 
+@app.route("/", methods=["GET"])
+def root():
+    return jsonify({"status": "Stock AI Backend Running"})
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
@@ -189,17 +212,25 @@ def search():
         result: pd.DataFrame = df[mask].head(20)
         stocks = []
         for _, row in result.iterrows():
-            code = str(row["代码"])
-            stocks.append(
-                {
-                    "code": code,
-                    "name": str(row["名称"]),
-                    "exchange": "SH" if code.startswith("6") else "SZ",
-                }
-            )
+            code_val = str(row["代码"])
+            stocks.append({
+                "code": code_val,
+                "name": str(row["名称"]),
+                "exchange": "SH" if code_val.startswith("6") else "SZ",
+            })
         return jsonify({"stocks": stocks})
-    except Exception as e:
-        return jsonify({"error": str(e), "stocks": []}), 500
+    except Exception:
+        stocks = []
+        for code, name in _stock_names.items():
+            if keyword.lower() in code.lower() or keyword in name:
+                stocks.append({
+                    "code": code,
+                    "name": name,
+                    "exchange": "SH" if code.startswith("6") else "SZ",
+                })
+                if len(stocks) >= 20:
+                    break
+        return jsonify({"stocks": stocks})
 
 
 @app.route("/analyze", methods=["GET"])
@@ -208,38 +239,29 @@ def analyze():
     if not code:
         return jsonify({"error": "请提供股票代码"}), 400
     try:
-        import akshare as ak
+        yf_code = _to_yf_code(code)
+        ticker = yf.Ticker(yf_code)
+        df = ticker.history(period="6mo")
 
-        end_date = datetime.now().strftime("%Y%m%d")
-        start_date = (datetime.now() - timedelta(days=180)).strftime("%Y%m%d")
-        df: pd.DataFrame = ak.stock_zh_a_hist(
-            symbol=code, period="daily", start_date=start_date,
-            end_date=end_date, adjust="qfq"
-        )
         if df.empty:
-            return jsonify({"error": "未获取到该股票数据"}), 404
+            return jsonify({"error": f"未获取到 {code} 的股票数据，请检查代码是否正确"}), 404
 
+        df = df.reset_index()
         df.columns = [c.lower() for c in df.columns]
-        col_map = {}
+        col_map = {c: c for c in df.columns}
         for c in df.columns:
-            if "日期" in c or "date" in c:
+            if "date" in c:
                 col_map[c] = "date"
-            elif "开盘" in c or "open" in c:
-                col_map[c] = "open"
-            elif "收盘" in c or "close" in c:
-                col_map[c] = "close"
-            elif "最高" in c or "high" in c:
-                col_map[c] = "high"
-            elif "最低" in c or "low" in c:
-                col_map[c] = "low"
-            elif "成交" in c or "volume" in c:
-                col_map[c] = "volume"
         df.rename(columns=col_map, inplace=True)
+
+        if "date" not in df.columns:
+            df["date"] = df.index.astype(str)
 
         close = df["close"].astype(float)
         high = df["high"].astype(float)
         low = df["low"].astype(float)
         vol = df["volume"].astype(float)
+        o = df["open"].astype(float)
 
         ma5 = calc_ma(close, 5)
         ma10 = calc_ma(close, 10)
@@ -253,28 +275,30 @@ def analyze():
         prev_close = float(close.iloc[-2]) if len(close) > 1 else today_close
         change_pct = round((today_close - prev_close) / prev_close * 100, 2)
 
-        support, pressure = find_support_resistance(df)
-        trend = assess_trend(df)
-        risk = assess_risk(rsi_val, trend, change_pct)
+        stock_name = _get_stock_name(code)
 
         kline = []
         for i in range(len(df)):
             row = df.iloc[i]
+            d = str(row["date"])
+            if " " in d:
+                d = d[:10]
             kline.append({
-                "date": str(row["date"])[:10],
-                "open": float(row["open"]),
-                "close": float(row["close"]),
-                "high": float(row["high"]),
-                "low": float(row["low"]),
-                "volume": float(row["volume"]),
+                "date": d,
+                "open": float(o.iloc[i]),
+                "close": float(close.iloc[i]),
+                "high": float(high.iloc[i]),
+                "low": float(low.iloc[i]),
+                "volume": float(vol.iloc[i]),
             })
 
-        try:
-            spot_df: pd.DataFrame = ak.stock_zh_a_spot_em()
-            spot_row = spot_df[spot_df["代码"] == code]
-            stock_name = str(spot_row.iloc[0]["名称"]) if not spot_row.empty else code
-        except Exception:
-            stock_name = code
+        # Use merged open/high/low/close for support/resistance
+        df_with_ohlc = pd.DataFrame({
+            "close": close, "high": high, "low": low
+        })
+        support, pressure = find_support_resistance(df_with_ohlc)
+        trend = assess_trend(df_with_ohlc)
+        risk = assess_risk(rsi_val, trend, change_pct)
 
         ma_latest = {
             "ma5": round(ma5[-1], 2) if ma5[-1] is not None else None,
